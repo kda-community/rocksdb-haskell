@@ -12,6 +12,13 @@ import           Database.RocksDB             (Compression (..), DB, compression
                                                createIfMissing, defaultOptions, get, open,
                                                put)
 
+import qualified Data.ByteString              as BS
+
+import           Database.RocksDB.Iterator    (iterFirst, iterNext, iterValid,
+                                                unsafeIterKey, unsafeIterValue,
+                                                withIter)
+import           Database.RocksDB.ReadOptions (ReadOptions, withReadOptions)
+
 import           Test.Hspec                   (describe, hspec, it, shouldReturn)
 import           Test.QuickCheck              (Arbitrary (..), UnicodeString (..),
                                                generate)
@@ -42,3 +49,33 @@ main =  hspec $ do
         put db def "zzz" "zzz"
         get db mempty "zzz"
       `shouldReturn` (Just "zzz")
+
+    it "should read keys and values via unsafeIterKey and unsafeIterValue" $ do
+      runResourceT $ withSystemTempDirectory "rocksdb" $ \path -> do
+        db <- initializeDB path
+        put db def "key1" "value1"
+        put db def "key2" "value2"
+        put db def "key3" "value3"
+        -- The continuations use 'BS.copy' so the results are independent of the
+        -- iterator-owned buffer, which is only valid until the iterator moves.
+        liftIO $ withReadOptions (mempty :: ReadOptions) $ \opts_ptr ->
+          withIter db opts_ptr $ \iter -> do
+            iterFirst iter
+            let go acc = do
+                  valid <- iterValid iter
+                  if not valid
+                    then return (reverse acc)
+                    else do
+                      mk <- unsafeIterKey   iter BS.copy
+                      mv <- unsafeIterValue iter BS.copy
+                      iterNext iter
+                      case (mk, mv) of
+                        (Just k, Just v) -> go ((k, v) : acc)
+                        _                -> go acc
+            go []
+      `shouldReturn`
+        [ ("key1", "value1")
+        , ("key2", "value2")
+        , ("key3", "value3")
+        ]
+

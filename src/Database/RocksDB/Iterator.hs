@@ -16,7 +16,9 @@ module Database.RocksDB.Iterator
     , iterNext
     , iterPrev
     , iterKey
+    , unsafeIterKey
     , iterValue
+    , unsafeIterValue
     , iterEntry
     , iterGetError
     , mapIter
@@ -26,7 +28,7 @@ module Database.RocksDB.Iterator
     )
 where
 
-import           Control.Exception            (bracket)
+import           Control.Exception            (bracket, evaluate)
 import           Control.Monad                (when)
 import           Control.Monad.IO.Class       (MonadIO (liftIO))
 import           Data.ByteString              (ByteString)
@@ -113,6 +115,30 @@ iterValue :: Iterator -> IO (Maybe ByteString)
 iterValue (Iterator iter_ptr) = liftIO $
     iterString iter_ptr c_rocksdb_iter_value
 
+-- | Like 'iterKey', but avoids copying the key out of RocksDB.
+--
+-- Rather than allocating a fresh 'ByteString' via `packCStringLen`, this wraps
+-- the RocksDB-owned buffer directly with `unsafePackCStringLen` and applies the
+-- supplied continuation to it. The result of the continuation is evaluated
+-- strictly (to weak head normal form) before this function returns.
+--
+-- The wrapped buffer is only valid while the iterator remains positioned at the
+-- current entry. Because the evaluation performed here is /not/ a full (deep)
+-- evaluation, you MUST ensure that the value produced by the continuation does
+-- not reference the input 'ByteString'. If it does, that reference will dangle
+-- once the iterator is advanced or destroyed, leading to undefined behaviour.
+unsafeIterKey :: Iterator -> (ByteString -> a) -> IO (Maybe a)
+unsafeIterKey (Iterator iter_ptr) f = liftIO $
+    unsafeIterString iter_ptr c_rocksdb_iter_key f
+
+-- | Like 'iterValue', but avoids copying the value out of RocksDB.
+--
+-- See 'unsafeIterKey' for the strictness and safety contract, which applies
+-- here in exactly the same way.
+unsafeIterValue :: Iterator -> (ByteString -> a) -> IO (Maybe a)
+unsafeIterValue (Iterator iter_ptr) f = liftIO $
+    unsafeIterString iter_ptr c_rocksdb_iter_value f
+
 -- | Return the current entry as a pair, if the iterator is currently positioned
 -- at an entry, ie. 'iterValid'.
 iterEntry :: Iterator -> IO (Maybe (ByteString, ByteString))
@@ -196,3 +222,28 @@ iterString iter_ptr f = do
             else do
                 len <- peek len_ptr
                 Just <$> BS.packCStringLen (ptr, cSizeToInt len)
+
+-- | Variant of 'iterString' that wraps the RocksDB-owned buffer with
+-- 'BU.unsafePackCStringLen' instead of copying it, applies the continuation
+-- @g@, and forces its result to weak head normal form before the buffer can be
+-- invalidated.
+--
+-- The caller is responsible for ensuring the result of @g@ does not reference
+-- the wrapped 'ByteString'; see the documentation of 'unsafeIterKey'.
+unsafeIterString :: IteratorPtr
+                 -> (IteratorPtr -> Ptr CSize -> IO CString)
+                 -> (ByteString -> a)
+                 -> IO (Maybe a)
+unsafeIterString iter_ptr f g = do
+    valid <- c_rocksdb_iter_valid iter_ptr
+    if valid == 0
+    then return Nothing
+    else
+        alloca $ \len_ptr -> do
+            ptr <- f iter_ptr len_ptr
+            if ptr == nullPtr
+            then return Nothing
+            else do
+                len <- peek len_ptr
+                bs <- BU.unsafePackCStringLen (ptr, cSizeToInt len)
+                Just <$> evaluate (g bs)
